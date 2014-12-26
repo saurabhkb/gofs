@@ -3,22 +3,22 @@ package main
 import (
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
-	"os"
 )
+
+/*
+======================
+FILESYSTEM
+=======================
+*/
 
 var root *MyNode
 
 /* define custom filesystem */
-type MyFS struct{}
-
-/* initializes the custom filesystem with a root mynode */
-func (MyFS) Init() {
-	root = new(MyNode)
-	root.Init("", os.ModeDir | 0755)
+type MyFS struct{
+	RootDir *MyNode
 }
 
 /* required to make MyFS implement `FS` interface */
-func (MyFS) Root() (fs.Node, fuse.Error) {
-	return root, nil
+func (f MyFS) Root() (fs.Node, fuse.Error) {
+	return f.RootDir, nil
 }
-
