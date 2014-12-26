@@ -1,0 +1,4 @@
+#hello
+alice,1,/tmp/mount/alice,/tmp/db/alice,127.0.0.1,3000
+bob,2,/tmp/mount/bob,/tmp/db/bob,127.0.0.1,3010
+charlie,3,/tmp/mount/charlie,/tmp/db/charlie,127.0.0.1,3020

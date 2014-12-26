@@ -1,5 +1,11 @@
-all:
-	go run flusher.go control.go myfs.go mynode.go chunker.go stableStorage.go main.go -debug /tmp/mount /tmp/db
+alice:
+	go run main.go -debug -name alice
 
-# /tmp/mount = mount point
-# /tmp/db = database location
+bob:
+	go run main.go -debug -name bob
+
+charlie:
+	go run main.go -debug -name charlie
+
+clean:
+	rm -rf /tmp/db

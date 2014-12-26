@@ -1,4 +1,4 @@
-package main
+package fsys
 
 import (
 	"bazil.org/fuse"
@@ -11,9 +11,8 @@ FILESYSTEM
 =======================
 */
 
-var root *MyNode
 
-/* define custom filesystem */
+/* define custom filesystem with RootDir and Pid */
 type MyFS struct{
 	RootDir *MyNode
 }

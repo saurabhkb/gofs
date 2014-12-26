@@ -6,11 +6,14 @@ import (
 	_ "bazil.org/fuse/fs/fstestutil"
 	"flag"
 	"fmt"
-	"log"
 	"os"
+	"log"
 	"os/signal"
+	"p4/storage"
+	"p4/util"
+	"p4/lock"
+	"p4/fsys"
 )
-
 
 
 /*
@@ -21,19 +24,6 @@ MAIN FUNCTION
 
 /* memfs implements a simple in-memory file system */
 
-var Debug = true
-
-/* Debug functions */
-func P_out(s string, args ...interface{}) {
-	if !Debug {
-		return
-	}
-	log.Printf(s, args...)
-}
-
-func P_err(s string, args ...interface{}) {
-	log.Printf(s, args...)
-}
 
 var Usage = func() {
 	fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
@@ -44,25 +34,30 @@ var Usage = func() {
 func main() {
 	flag.Usage = Usage
 	debugPtr := flag.Bool("debug", false, "print lots of stuff")
+	namePtr := flag.String("name", "auto", "replica name")
+	newfsPtr := flag.Bool("newfs", false, "reinitialize local filesystem")
 	flag.Parse()
-	Debug = *debugPtr
 
-	if flag.NArg() != 2 {
-		Usage()
-		os.Exit(2)
+	util.SetDebug(*debugPtr)
+
+	util.SetConfigFile(*namePtr)
+	err, serverName, pid, mountpoint, dbpath, hostEndpoint := util.GetConfigDetailsFromName(*namePtr)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+	storage.Init(dbpath)
+
+	/* if newfs flag is true, clear storage */
+	if *newfsPtr {
+		storage.Clear()
 	}
 
-	/* get mount point and database location from user */
-	mountpoint := flag.Arg(0)
-	dbpath := flag.Arg(1)
-
-	/* initialize the database */
-	InitDatabase(dbpath)
-
-	/* initialize the lock */
-	InitLock()
+	lock.Init()
 
 	/* unmount previously mounted filesystem (if any) */
+	mounterr := os.MkdirAll(mountpoint, os.ModeDir | 0755)
+	util.P_out("mount creation err: %v", mounterr)
 	fuse.Unmount(mountpoint) //!!
 	c, err := fuse.Mount(mountpoint)
 	if err != nil {
@@ -70,11 +65,19 @@ func main() {
 	}
 	defer c.Close()
 
-	/* create and initialize new custom filesystem */
-	var MyFileSystem = MyFS{}
-	LoadState()
-	LoadFS(&MyFileSystem)
+	endpointList := util.ReadAllEndpoints()
+	fsys.Init(serverName, pid, mountpoint, dbpath, hostEndpoint)
 
+	fsys.StartPub()
+	fsys.StartRep()
+	fsys.StartReq()
+
+	/* create and initialize new custom filesystem */
+	var MyFileSystem = fsys.MyFS{}
+	fsys.SetMyPid(pid)
+	fsys.LoadState()
+	fsys.LoadFS(&MyFileSystem)
+	fsys.StartSub(endpointList, &MyFileSystem)
 
 	/* serve the filesystem from the mountpoint */
 	go func() {
@@ -91,29 +94,22 @@ func main() {
 	}()
 
 
-	writeBackQuitter := make(chan bool)
-	var flusher Flusher
-
 	/* start the flusher */
-	go flusher.flush(writeBackQuitter, &MyFileSystem)
+	writeBackQuitter := make(chan bool)
+	go fsys.Flush(writeBackQuitter, &MyFileSystem)
 
 
 	/* gracefully end the system */
 	sigchan := make(chan os.Signal)
 	signal.Notify(sigchan, os.Interrupt)	// die on interrupt
 	<-sigchan
-	P_out("received interrupt")
-
-	P_out("ending flusher (could take a few seconds)")
+	util.P_out("received interrupt")
+	util.P_out("ending flusher (could take a few seconds)")
 	writeBackQuitter <- true
-
-
-	P_out("ending filesystem serve")
-	P_out("In order to gracefully unmount, the filesystem should not be in use (otherwise it will block)")
-	// unmount fuse
+	util.P_out("ending filesystem serve")
+	util.P_out("In order to gracefully unmount, the filesystem should not be in use (otherwise it will block)")
 	fuse.Unmount(mountpoint)
 	c.Close()
-	P_out("ended filesystem serve")
-
+	util.P_out("ended filesystem serve")
 	os.Exit(0)
 }
