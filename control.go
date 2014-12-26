@@ -4,15 +4,13 @@ import (
 	"fmt"
 	"encoding/json"
 	"os"
-	"strconv"
 	"sync"
 )
 
 /* namespaces for the data store */
 const DATA_KEY string = "DATA_KEY"
 const NODE_VERSION_KEY string = "NDV"
-const NEXT_AVAILABLE_VID_KEY string = "NXT_AVLBL_VID"
-const NEXT_AVAILABLE_INODE_KEY string = "NXT_AVLBL_INODE"
+const NODE_VERSION_LIST string = "NDVL"
 const STATE_KEY = "STATE"
 
 
@@ -21,6 +19,7 @@ type STATE struct {
 	Root_version_bootstrap int	/* latest root version */
 	NextInode uint64			/* next available inode number */
 	NextVId int					/* next available version number */
+	NextNId int					/* next available node id */
 }
 
 /* important variables */
@@ -37,18 +36,15 @@ func LoadState() {
 	statestr, _ := db.Get([]byte(STATE_KEY))
 	json.Unmarshal(statestr, &state)
 	state.NextInode++
-	P_out("state: %v", state)
 }
 
 /* places an fs object in the memory pointed to by the argument */
 func LoadFS(fs *MyFS) {
 	/* state.Root_version_bootstrap is Vid of root of filesystem */
 	str := fmt.Sprintf("%s:%d", NODE_VERSION_KEY, state.Root_version_bootstrap)
-	P_out("%v\n", str)
 	rootdirstr, err := db.Get([]byte(str))
 	if err != nil {
 		/* key most likely doesn't exist */
-		P_out("%v", err)
 		fs.RootDir = new(MyNode)
 		fs.RootDir.Init("/", os.ModeDir | 0755, nil)
 		SaveNodeVersion(fs.RootDir)
@@ -76,22 +72,9 @@ func GetAvailableVersionId() int {
 	return state.NextVId
 }
 
-
-/* method which takes data and chunks it for storage based on Rabin Karp. returns an array of chunk hashes, offsets and lengths */
-func ChunkifyAndStoreRK(data []byte) ([]string, []int, []int) {
-	off := 0
-	chunkHashes := []string{}
-	offsets := []int{}
-	lengths := []int{}
-	dataLen := len(data)
-	for off < len(data) {
-		ret, hash := rkchunk(data[off:], uint64(dataLen - off))
-		chunkHashes = append(chunkHashes, strconv.FormatUint(hash, 10))
-		offsets = append(offsets, off)
-		lengths = append(lengths, int(ret))
-		off += int(ret)
-	}
-	return chunkHashes, offsets, lengths
+func GetAvailableUid() int {
+	state.NextNId++
+	return state.NextNId
 }
 
 
@@ -105,7 +88,7 @@ func SaveNodeVersion(node *MyNode) bool {
 }
 
 /* load node */
-func loadNodeVersion(Vid int) *MyNode {
+func LoadNodeVersion(Vid int) *MyNode {
 	var x MyNode
 	nodestr, _ := db.Get([]byte(fmt.Sprintf("%s:%v", NODE_VERSION_KEY, Vid)))
 	json.Unmarshal(nodestr, &x)
@@ -113,7 +96,7 @@ func loadNodeVersion(Vid int) *MyNode {
 }
 
 /* load data */
-func loadDataChunk(hash string) []byte {
+func LoadDataChunk(hash string) []byte {
 	ret, _ := db.Get([]byte(fmt.Sprintf("%s:%v", DATA_KEY, hash)))
 	return ret
 }
@@ -122,7 +105,6 @@ func loadDataChunk(hash string) []byte {
 /* expands this node and loads its children (if it hasn't already been done) */
 func assertExpanded(node *MyNode) {
 	if !node.expanded {
-		P_out("expanding: %v", node.Name)
 		/* dirty, children, data */
 		node.dirty = false;
 
@@ -130,13 +112,13 @@ func assertExpanded(node *MyNode) {
 			/* children, not data */
 			node.children = make(map[string]*MyNode)
 			for name, Vid := range node.ChildVids {
-				node.children[name] = loadNodeVersion(Vid)
+				node.children[name] = LoadNodeVersion(Vid)
 				node.children[name].parent = node
 			}
 		} else {
 			/* data, not children */
 			for i := 0; i < len(node.DataBlocks); i++ {
-				loadedData := loadDataChunk(node.DataBlocks[i])
+				loadedData := LoadDataChunk(node.DataBlocks[i])
 				for j := 0; j < len(loadedData); j++ {
 					node.data = append(node.data, loadedData[j])
 				}
@@ -144,7 +126,39 @@ func assertExpanded(node *MyNode) {
 		}
 
 		node.expanded = true
+	}
+}
+
+
+/* versioning */
+func RegisterNodeVersion(nodeID int, versionID int) {
+	key := []byte(fmt.Sprintf("%s:%d", NODE_VERSION_LIST, nodeID))
+	existingListStr, err := db.Get(key)
+	if err != nil { /* key not present */
+		valstr, _ := json.Marshal([]int{versionID})
+		db.Put(key, []byte(valstr))
 	} else {
-		P_out("node %v is already expanded. twiddling thumbs...", node.Name)
+		var existingList []int
+		json.Unmarshal(existingListStr, &existingList)
+
+		/* defensive => make sure that new version is older than last version in the last otherwise ignore */
+		if versionID > existingList[len(existingList) - 1] {
+			existingList = append(existingList, versionID)
+			newListStr, _ := json.Marshal(existingList)
+			db.Put(key, newListStr)
+		}
+	}
+}
+
+func GetNodeVersions(nodeID int) []int {
+	key := []byte(fmt.Sprintf("%s:%d", NODE_VERSION_LIST, nodeID))
+	lstr, err := db.Get(key)
+	if err != nil {
+		return []int{}
+	} else {
+		var versionList []int
+		json.Unmarshal(lstr, &versionList)
+		P_out("%d versions=> %v", nodeID, versionList)
+		return versionList
 	}
 }

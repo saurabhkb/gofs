@@ -6,6 +6,8 @@ import (
 	"bazil.org/fuse/fs"
 	"fmt"
 	"time"
+	"strings"
+	"syscall"
 )
 
 /*
@@ -14,19 +16,25 @@ NODE
 =======================
 */
 
-var uid = os.Geteuid()
-var gid = os.Getegid()
-
 /*
 	MyNode
 	Implements the Node interface (as it has a Attr() method which returns an object implementing Attr)
 */
 type MyNode struct {
+
+	NodeID int	/* unique ID in the face of versions and renames */
+
 	Vid int
 	Name string
 	Attrib fuse.Attr
 
 	dirty bool
+
+	/*
+		set only if the node is a directory corresponding to an archive.
+		Note: the actual archive files/dirs themselves do not have this set
+	*/
+	archive bool
 
 	expanded bool
 
@@ -63,8 +71,9 @@ func (n *MyNode) fuseType() fuse.DirentType {
 
 /* initialization of this mynode */
 func (n *MyNode) Init(name string, mode os.FileMode, parent *MyNode) {
-	P_out("INIT: inited node inode %d, %q and len = %d\n", n.Attrib.Inode, name, len(n.children))
-	P_out("INIT: number of children for %q is %d\n", name, len(n.children))
+
+	n.NodeID = GetAvailableUid()
+
 	n.Attrib.Inode = GetAvailableInode()
 	n.Attrib.Nlink = 1
 	n.Name = name
@@ -76,14 +85,16 @@ func (n *MyNode) Init(name string, mode os.FileMode, parent *MyNode) {
 	n.Attrib.Crtime = tm
 	n.Attrib.Mode = mode
 
-	n.Attrib.Gid = uint32(gid)
-	n.Attrib.Uid = uint32(uid)
+	n.Attrib.Gid = uint32(os.Getegid())
+	n.Attrib.Uid = uint32(os.Geteuid())
 
 	n.Attrib.Size = 0
 
 	n.parent = parent
 
 	n.dirty = false
+
+	n.archive = false
 
 	n.children = make(map[string]*MyNode)
 	n.ChildVids = make(map[string]int)
@@ -93,14 +104,11 @@ func (n *MyNode) Init(name string, mode os.FileMode, parent *MyNode) {
 
 /* An Attr method to return the basic file attributes defined by Attr. Required to implement Node interface */
 func (n *MyNode) Attr() fuse.Attr {
-	LOCK.Lock()
-	defer LOCK.Unlock()
 	return n.Attrib
 }
 
 /* checks whether a child with name `name` exists */
 func (n *MyNode) Lookup(name string, intr fs.Intr) (fs.Node, fuse.Error) {
-	P_out("LOOKUP: looking up %s in %s", name, n.Name)
 	assertExpanded(n)
 	if k, ok := n.children[name]; ok {
 		return k, nil
@@ -110,7 +118,6 @@ func (n *MyNode) Lookup(name string, intr fs.Intr) (fs.Node, fuse.Error) {
 
 /* reads directory. */
 func (n *MyNode) ReadDir(intr fs.Intr) ([]fuse.Dirent, fuse.Error) {
-	P_out("READING DIR: %s", n.Name)
 	LOCK.Lock()
 	defer LOCK.Unlock()
 	assertExpanded(n)
@@ -123,7 +130,6 @@ func (n *MyNode) ReadDir(intr fs.Intr) ([]fuse.Dirent, fuse.Error) {
 
 /* must be defined or editing w/ vi or emacs fails. Doesn't have to do anything */
 func (n *MyNode) Fsync(req *fuse.FsyncRequest, intr fs.Intr) fuse.Error {
-	//P_out("FSYNC: %v", req)
 	LOCK.Lock()
 	defer LOCK.Unlock()
 	return nil
@@ -131,43 +137,120 @@ func (n *MyNode) Fsync(req *fuse.FsyncRequest, intr fs.Intr) fuse.Error {
 
 /* creates a directory */
 func (p *MyNode) Mkdir(req *fuse.MkdirRequest, intr fs.Intr) (fs.Node, fuse.Error) {
-	//P_out("MKDIR: %q in %q\n", req.Name, p.Name)
 	LOCK.Lock()
 	defer LOCK.Unlock()
 	assertExpanded(p)
-	d := new(MyNode)
-	d.Init(req.Name, os.ModeDir|0755, p)
-	p.children[req.Name] = d
 
-	current := d
-	for current != nil {
-		current.Vid = GetAvailableVersionId()
-		if current.parent != nil {
-			current.parent.ChildVids[current.Name] = current.Vid
-		}
-		SaveNodeVersion(current)
-		current = current.parent
+	if !isAllowed(p, "w") {
+		return nil, fuse.Errno(syscall.EACCES)
 	}
 
-	return d, nil
+	if strings.Contains(req.Name, "@") {
+		tokens := strings.Split(req.Name, "@")
+		filename := tokens[0]
+
+		/* this assumes that it hasn't been deleted */
+		trial, found := p.children[filename]
+
+		var n *MyNode = nil
+		if !found {
+			/* if it has been deleted, look at old versions of the parent to see if we can find it */
+			/* NOTE: currently, even if the node has been moved somewhere else, this will still allow the archive to be created */
+			P_out("looking through old versions of parent")
+			parentVersions := GetNodeVersions(p.NodeID)
+			for i := len(parentVersions) - 1; i >= 0; i-- {
+				vnode := LoadNodeVersion(parentVersions[i])
+				vid, err := vnode.ChildVids[filename]
+				if err {
+					/* version found */
+					n = LoadNodeVersion(vid)
+					break
+				}
+			}
+		} else {
+			n = trial
+		}
+
+		if(n == nil) {
+			return nil, fuse.Errno(syscall.ENOENT)
+		}
+
+		if n.isDir() {
+			date := tokens[1]
+			finalTime := parseTime(date)
+			P_out("final time: %v", finalTime)
+			versions := GetNodeVersions(n.NodeID)
+			var prev *MyNode = nil
+			for i := 0; i < len(versions); i++ {
+				vnode := LoadNodeVersion(versions[i])
+				if vnode.Attrib.Mtime.Before(finalTime) {
+					prev = vnode
+				} else {
+					break
+				}
+			}
+			if prev != nil {
+				/* copy all of prev's children into d */
+				d := new(MyNode)
+				d.Init(req.Name, os.ModeDir|0555, p)
+				p.children[req.Name] = d
+				for k, v := range prev.ChildVids {
+					d.ChildVids[k] = v
+				}
+				P_out("state of children: %v", d.ChildVids)
+				d.archive = true
+				return d, nil
+			} else {
+				/* trying to get a version from before the folder was actually created */
+				return nil, fuse.EPERM
+			}
+		} else {
+			d := new(MyNode)
+			d.Init(req.Name, os.ModeDir|0444, p)
+			p.children[req.Name] = d
+			versions := GetNodeVersions(n.NodeID)
+			for i := 0; i < len(versions); i++ {
+				vnode := LoadNodeVersion(versions[i])
+				vnode.Name = vnode.Name + ".[" + vnode.Attrib.Mtime.Format("Mon Jan 2 15:04:05 -0700 MST 2006") + "]"
+				vnode.Attrib.Mode = vnode.Attrib.Mode & 0444;	/* make it read-only */
+				P_out("vnode: %v", vnode.Attrib.Mtime)
+				d.children[vnode.Name] = vnode
+			}
+			d.expanded = true
+			d.archive = true
+			return d, nil
+		}
+
+
+	} else {
+		d := new(MyNode)
+		d.Init(req.Name, os.ModeDir|0755, p)
+		p.children[req.Name] = d
+
+		updateAncestors(d)
+
+		d.Attrib.Mtime = time.Now()
+		current := d.parent
+		for current != nil {
+			current.Attrib.Mtime = d.Attrib.Mtime
+			current = current.parent
+		}
+
+		return d, nil
+	}
 }
 
 /* creates a file */
 func (p *MyNode) Create(req *fuse.CreateRequest, resp *fuse.CreateResponse, intr fs.Intr) (fs.Node, fs.Handle, fuse.Error) {
-	//P_out("CREATE: %q in %q\n with mode %v", req.Name, p.Name, req.Mode)
-	//P_out("CREATE: response: %v", resp)
 	LOCK.Lock()
 	defer LOCK.Unlock()
 	assertExpanded(p)
+	if !isAllowed(p, "w") {
+		return nil, nil, fuse.Errno(syscall.EACCES)
+	}
 	f := new(MyNode)
 	f.Init(req.Name, req.Mode, p)
 	p.children[req.Name] = f
-	// p.ChildVids[req.Name] = f.Vid <- cant create Vid entry here, no Vid has been assigned yet! (it gets assigned in Write!)
-
-	/*
-		nothing specified in the Handle interface, so just return same mynode object.
-		mynode has method ReadAll and hence implements interface HandleReadAller
-	*/
 	return f, f, nil
 }
 
@@ -176,18 +259,36 @@ func (p *MyNode) Remove(req *fuse.RemoveRequest, intr fs.Intr) fuse.Error {
 	LOCK.Lock()
 	defer LOCK.Unlock()
 	assertExpanded(p)
+
+	if !isAllowed(p, "w") {
+		return fuse.Errno(syscall.EACCES)
+	}
+
+
+	P_out("remove: %s", p.Name)
 	child, ok := p.children[req.Name] /* child is to be deleted */
+
+	/* update the structure and remove the subtree rooted here */
+	if child.archive {
+		P_out("special case of rmdir: removing archive")
+		delete(p.children, req.Name)
+		child = nil
+		return nil
+	}
+
 	if !ok {
 		P_out("invalid file or directory!")
 		return fuse.ENOENT
 	} else {
-		performDelete := (req.Dir && child.isDir() && len(child.children) == 0) || (!req.Dir && !child.isDir())
+		performDelete := (req.Dir && child.isDir() && len(child.ChildVids) == 0) || (!req.Dir && !child.isDir())
 
 		if performDelete {
 			delete(p.children, req.Name)
 			delete(p.ChildVids, req.Name)
 			updateAncestors(p)
 			child = nil
+		} else {
+			return fuse.Errno(syscall.EPERM)
 		}
 	}
 	return nil
@@ -198,6 +299,9 @@ func (n *MyNode) Write(req *fuse.WriteRequest, resp *fuse.WriteResponse, intr fs
 	LOCK.Lock()
 	defer LOCK.Unlock()
 	assertExpanded(n)
+	if !isAllowed(n, "w") {
+		return fuse.Errno(syscall.EACCES)
+	}
 
 	/* helper variable to avoid all the typecasts */
 	dataLen64 := int64(len(req.Data))
@@ -213,7 +317,6 @@ func (n *MyNode) Write(req *fuse.WriteRequest, resp *fuse.WriteResponse, intr fs
 	}
 
 	/* copy out the data */
-	P_out("[%v], len=%d, cap=%d, offset=%d, len(req.Data)=%d\n", string(n.data), len(n.data), cap(n.data), req.Offset, len(req.Data))
 	for i := 0; i < len(req.Data); i++ {
 		n.data[int(req.Offset) + i] = req.Data[i]
 	}
@@ -228,6 +331,11 @@ func (n *MyNode) Write(req *fuse.WriteRequest, resp *fuse.WriteResponse, intr fs
 
 	/* update modified time */
 	n.Attrib.Mtime = time.Now()
+	current := n.parent
+	for current != nil {
+		current.Attrib.Mtime = n.Attrib.Mtime
+		current = current.parent
+	}
 
 	/* all sorts of new stuff to be done here for persistence */
 
@@ -244,7 +352,14 @@ func (n *MyNode) Write(req *fuse.WriteRequest, resp *fuse.WriteResponse, intr fs
 func (n *MyNode) ReadAll(intr fs.Intr) ([]byte, fuse.Error) {
 	LOCK.Lock()
 	defer LOCK.Unlock()
+	if !isAllowed(n, "r") {
+		P_out("CANT read stuff from %s", n.Name)
+		return nil, fuse.Errno(syscall.EACCES)
+	}
 	assertExpanded(n)
+	P_out("reading stuff size=%d, from %s", n.Attrib.Size, n.Name)
+	P_out("datablocks: %v", n.DataBlocks)
+	P_out("data: %s", n.data)
 	return n.data[:n.Attrib.Size], nil
 }
 
@@ -254,7 +369,6 @@ func (n *MyNode) ReadAll(intr fs.Intr) ([]byte, fuse.Error) {
 	(There is no guarantee that it will be called after file writes)
 */
 func (n *MyNode) Flush(req *fuse.FlushRequest, intr fs.Intr) fuse.Error {
-	//P_out("FLUSH: %q\n", n.Name)
 	LOCK.Lock()
 	defer LOCK.Unlock()
 	return nil
@@ -262,14 +376,21 @@ func (n *MyNode) Flush(req *fuse.FlushRequest, intr fs.Intr) fuse.Error {
 
 /* rename a file (p = parent node) */
 func (p *MyNode) Rename(req *fuse.RenameRequest, newDir fs.Node, intr fs.Intr) fuse.Error {
-	//P_out("RENAME: newDirNid=%v, newDir=[%v], oldname=%s, newname=%s\n", req.NewDir, newDir, req.OldName, req.NewName)
-	//P_out("RENAME: this node: %v", p)
 	LOCK.Lock()
 	defer LOCK.Unlock()
 	assertExpanded(p)
 
+	if !isAllowed(p, "w") {
+		return fuse.Errno(syscall.EACCES)
+	}
+
 	/* remove child from current parent */
 	childToRename := p.children[req.OldName]
+
+	if childToRename.archive {
+		return fuse.Errno(syscall.EPERM)
+	}
+
 	delete(p.children, req.OldName)
 	delete(p.ChildVids, req.OldName)
 	updateAncestors(p)
@@ -280,7 +401,6 @@ func (p *MyNode) Rename(req *fuse.RenameRequest, newDir fs.Node, intr fs.Intr) f
 	if !ok {
 		return fuse.EIO
 	}
-	//P_out("RENAME: new parent mynode: %v", newParent)
 	newParent.children[req.NewName] = childToRename
 	childToRename.Name = req.NewName
 	childToRename.parent = newParent
@@ -300,6 +420,12 @@ func (n *MyNode) Getattr(req *fuse.GetattrRequest, resp *fuse.GetattrResponse, i
 func (n *MyNode) Setattr(req *fuse.SetattrRequest, resp *fuse.SetattrResponse, intr fs.Intr) fuse.Error {
 	LOCK.Lock()
 	defer LOCK.Unlock()
+
+	if !isAllowed(n, "w") {
+		P_out("set attr is not allowed for %s", n.Name)
+		return fuse.Errno(syscall.EACCES)
+	}
+
 	if req.Valid.Mode() {
 		n.Attrib.Mode = req.Mode
 	}
@@ -319,6 +445,7 @@ func (n *MyNode) Setattr(req *fuse.SetattrRequest, resp *fuse.SetattrResponse, i
 		n.Attrib.Size = req.Size
 	}
 	updateAncestors(n)
+
 	return nil
 }
 
@@ -328,10 +455,76 @@ func updateAncestors(node *MyNode) {
 	current := node
 	for current != nil {
 		current.Vid = GetAvailableVersionId()
+		//RegisterNodeVersion(current.NodeID, current.Vid)  <== should happen in flusher (otherwise you get node versions without corresponding saved node)
 		if current.parent != nil {
 			current.parent.ChildVids[current.Name] = current.Vid
 		}
 		SaveNodeVersion(current)
 		current = current.parent
 	}
+}
+
+func parseTime(date string) time.Time {
+	t, boolerr := peteTime(date)
+	var finalTime time.Time
+	if boolerr {
+		/* its of the form: foo@-1m */
+		duration, _ := time.ParseDuration(date)
+		finalTime = time.Now().Add(duration)
+		P_out("duration based final time: %v", finalTime)
+	} else {
+		/* its of the form: foo@2014-09-18 9:20 */
+		finalTime = t
+	}
+	return finalTime
+}
+
+func peteTime(s string) (time.Time, bool) {
+	timeFormats := []string{
+		"2006-1-2 15:04:05",
+		"2006-1-2 15:04",
+		"2006-1-2",
+		"1-2-2006 15:04:05",
+		"1-2-2006 15:04",
+		"1-6-2006",
+		"2006/1/2 15:04:05",
+		"2006/1/2 15:04",
+		"2006/1/2",
+		"1/2/2006 15:04:05",
+		"1/2/2006 15:04",
+		"1/2/2006",
+	}
+	loc, _ := time.LoadLocation("Local")
+
+	for _,v := range timeFormats {
+		if tm, terr := time.ParseInLocation(v, s, loc); terr == nil {
+			return tm, false
+		}
+	}
+	return time.Time{}, true
+}
+
+/*rwxrwxrwx
+010010010
+1 0010 0100
+124
+*/
+
+func isAllowed(node *MyNode, operation string) bool {
+	switch(operation) {
+		case "w": {
+			current := node.parent
+			for current != nil {
+				if current.archive {
+					return false
+				}
+				current = current.parent
+			}
+			return node.Attrib.Mode.Perm() & 0x00000092 > 0
+		}
+		case "r": {
+			return node.Attrib.Mode.Perm() & 0x00000124 > 0
+		}
+	}
+	return false
 }

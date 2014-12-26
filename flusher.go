@@ -24,21 +24,15 @@ func (Flusher) flush(quit chan bool, fs *MyFS) {
 	for {
 		select {
 			case <-quit: {
-				P_out("CLOSING FLUSHER!")
 				db.Close()
 				return
 			}
 			default: {
-				P_out("FLUSHER: attempting to lock")
 				LOCK.Lock()
-				P_out("FLUSHER: lock successful")
 				generalRoot, _ := fs.Root()
-				P_out("got fs.Root()")
 				root, _ = generalRoot.(*MyNode)	// ignore error for now, ideally there shouldnt be any (maybe panic if there is)
-				P_out("made sure it was a *MyNode")
 				writeBack(root)
 				LOCK.Unlock()
-				P_out("FLUSHER: unlock successful")
 				time.Sleep(time.Duration(SLEEP_SECONDS) * time.Second)
 			}
 		}
@@ -51,6 +45,7 @@ func writeBack(root *MyNode) {
 		return
 	}
 
+
 	if root.isDir() {
 		assertExpanded(root)
 		// if im a dir, recursively save children, then save myself (postorder)
@@ -60,7 +55,6 @@ func writeBack(root *MyNode) {
 	} else {
 		assertExpanded(root)
 		// if im a file, write out my data blocks and hashes
-		fmt.Println("LENGTHS:", len(root.DataBlocks), len(root.BlockOffsets), len(root.BlockLengths))
 		for i := 0; i < len(root.DataBlocks); i++ {
 			str := root.DataBlocks[i]
 			off := root.BlockOffsets[i]
@@ -73,10 +67,14 @@ func writeBack(root *MyNode) {
 	nodestr, _ := json.Marshal(root)
 	db.Put([]byte(fmt.Sprintf("%s:%v", NODE_VERSION_KEY, root.Vid)), nodestr)
 
+	RegisterNodeVersion(root.NodeID, root.Vid)
+
+	P_out("write back %s", root.Name)
+	root.dirty = false
+
 	// save the state as well (only once at the very end)
 	if root.parent == nil {
 		statestr, _ := json.Marshal(state)
-		err := db.Put([]byte(STATE_KEY), statestr)
-		P_out("Saving state error: %v", err)
+		db.Put([]byte(STATE_KEY), statestr)
 	}
 }

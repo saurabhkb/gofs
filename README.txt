@@ -23,7 +23,7 @@ just a basic structure describing a filesystem
 mynode.go
 contains the functionality of a node
 
-rk.go
+chunker.go
 contains method for chunking based on Rabin-Karp
 
 stableStorage.go
@@ -31,3 +31,7 @@ provides interface to write to stable storage independent of the actual database
 
 main.go
 contains the main method, calls functions from all the other files, sets everything running, closes everything on interrupt
+
+
+ARCHIVING
+Archive directories and their contents are read only. They can only be removed with the rmdir command.
